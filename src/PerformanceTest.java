@@ -36,12 +36,16 @@ public class PerformanceTest {
      * 逻辑与 MeanCalculator 一致：每个 worker 求切片的和，主线程用 总和 / 总个数 求均值。
      */
     private static BigInteger runParallelMean(DataSet dataSet, int numSlices) throws InterruptedException {
-        BigInteger[][] data = dataSet.getSlicedData(numSlices);
+        // 零拷贝：只拿共享原数组和各线程的 {start, length}，不复制数据。
+        // 于是原来那段串行复制 1500 万元素的开销（约占 1 线程耗时的 13%）被消除，
+        // Amdahl 定律里的串行占比大幅下降，加速上限被推高。
+        BigInteger[] data = dataSet.getData();
+        int[][] ranges = dataSet.getSliceRanges(numSlices);
 
         MeanWorker[] workers = new MeanWorker[numSlices];
         Thread[] threads = new Thread[numSlices];
         for (int i = 0; i < numSlices; i++) {
-            workers[i] = new MeanWorker(data[i]);
+            workers[i] = new MeanWorker(data, ranges[i][0], ranges[i][1]);
             threads[i] = new Thread(workers[i]);
         }
 

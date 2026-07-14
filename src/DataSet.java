@@ -26,30 +26,33 @@ public class DataSet {
             nums[i] = BigInteger.valueOf(i);
         }
     }
-    public BigInteger[][] getSlicedData (int slices){
-        // 一个数组切成 n 份切片，然后放在一个新数组 res 里。
-        // 注意：length 不一定能被 n 整除，如果直接用 length / n 做每片大小，
-        // 余数部分的元素会被悄悄丢弃（数据丢失）。
-        // 这里改为把余数平摊到前 remainder 个切片，保证所有元素都被覆盖、且各片大小最多相差 1。
+    // 返回底层原数组（只读共享）。零拷贝方案下，各线程直接在这个数组上读自己那一段。
+    public BigInteger[] getData(){
+        return this.nums;
+    }
+
+    /**
+     * 零拷贝切片：不复制任何数据，只计算每个切片在原数组中的“起点 start 和长度 length”。
+     * 返回 int[n][2]，第 i 行是 {start, length}。
+     *
+     * 注意：length 不一定能被 n 整除。若直接用 length / n 当每片大小，余数部分会被悄悄丢弃。
+     * 这里把余数平摊到前 remainder 个切片，保证所有元素都被覆盖、且各片大小最多相差 1。
+     */
+    public int[][] getSliceRanges (int slices){
         int n = slices;
         int base = length / n;        // 每个切片至少有的元素个数
         int remainder = length % n;   // 需要额外分配 1 个元素的切片数量
 
-        // 用python切片代替下边的所有代码：
-        //return [this.nums[i*slicesSize:(i+1)*slicesSize] for i in range(n)]
-        BigInteger[][] res = new BigInteger[n][];
+        int[][] ranges = new int[n][2];
         int start = 0;                // 当前切片在 nums 中的起始下标
         for(int i = 0; i < n; i++){
             // 前 remainder 个切片各多分到 1 个元素
             int sliceSize = base + (i < remainder ? 1 : 0);
-            res[i] = new BigInteger[sliceSize];
-            for(int j = 0; j < sliceSize; j++){
-                res[i][j] = this.nums[start + j];
-            }
+            ranges[i][0] = start;
+            ranges[i][1] = sliceSize;
             start += sliceSize;
         }
-        return res;
-
+        return ranges;
     }
 
 

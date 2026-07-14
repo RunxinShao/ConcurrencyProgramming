@@ -16,12 +16,13 @@ public class MeanCalculator {
 
     public static void main(String[] args) throws InterruptedException{
         DataSet dataSet = new DataSet(INPUT_LIST_SIZE);
-        BigInteger[][] data = dataSet.getSlicedData(NUM_OF_WORKERS);
+        BigInteger[] data = dataSet.getData();                     // 共享原数组（只读）
+        int[][] ranges = dataSet.getSliceRanges(NUM_OF_WORKERS);   // 各线程负责的 {start, length}
 
         MeanWorker[] workers = new MeanWorker[NUM_OF_WORKERS];
         Thread[] threads = new Thread[NUM_OF_WORKERS];
         for(int i = 0 ; i < NUM_OF_WORKERS; i++){
-            workers[i] = new MeanWorker(data[i]);
+            workers[i] = new MeanWorker(data, ranges[i][0], ranges[i][1]);
             threads[i] = new Thread(workers[i]);
         }
 
