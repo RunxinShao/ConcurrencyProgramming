@@ -34,3 +34,30 @@ Coding Practices for Concurrency Programming and Multithreading
 ### Takeaway
 
 On this M5 Max, the sweet spot is **~4–6 threads**, aligned with the 6 Super Cores. Past that, the heterogeneous Super/Performance-core architecture plus a `join`-on-slowest design causes sharp efficiency loss, and the serial slicing step caps the overall speedup at ~7.5× — a core-count-independent limit set by Amdahl's Law. To push further, eliminate the serial copy (use offset/length index ranges so threads read the original array directly).
+
+## Optimization: Zero-Copy Slicing
+
+Following the takeaway above, the serial slicing step was removed. Instead of copying each slice into a fresh array on the main thread, every worker now receives `(sharedArray, start, length)` and reads its own contiguous range **directly from the original array** — no data is copied.
+
+This is thread-safe: all threads only **read** the shared array (no thread writes it), and their ranges are non-overlapping. A data race requires at least one writer, so read-only sharing needs no locks.
+
+### Results — before vs after
+
+| Threads / Slices | Before (copy) | After (zero-copy) | Speedup vs 1 (after) |
+|---|---|---|---|
+| 1  | 150 ms | 141 ms | 1.00× |
+| 2  | 79 ms  | 63 ms  | 2.24× |
+| 4  | 38 ms  | 22 ms  | 6.4× |
+| 8  | 29 ms  | 12 ms  | 11.75× |
+| 16 | 21 ms  | 9 ms   | 15.7× |
+| 32 | 20 ms  | 9 ms   | 15.7× |
+
+### Why it got faster
+
+Two distinct effects combine:
+
+**1. Less total work (absolute times drop across the board).** The ~15M-element copy is gone entirely, so even a single thread improves (150 → 141 ms) despite having no parallelism to gain from — the work itself shrank.
+
+**2. Smaller serial fraction → higher Amdahl ceiling (this is the big one).** Amdahl's Law caps max speedup at `1 / serial_fraction`. Before, the serial copy was ~13% of the 1-thread time, capping speedup at `1 / 0.13 ≈ 7.7×` — which is exactly where the old numbers plateaued. Removing it drives the serial fraction toward ~0, lifting the ceiling toward the physical core count. The measured speedup now reaches **~15.7×** (approaching the 18-core limit) instead of stalling at 7.5×, and the previously-flat 8→16 region regains near-linear gains.
+
+> Note: these are demonstrative measurements, not a rigorous benchmark. The OS scheduler is preemptive (threads can be interrupted or migrated between cores), and JIT warmup / GC pauses add noise, so the near-/super-linear figures past 4 threads carry measurement error. The **trend** — a much higher speedup ceiling once the serial copy is removed — is the robust, reproducible result.
