@@ -1,3 +1,5 @@
+package parallelcomputation;
+
 import java.math.BigInteger;
 
 /**
@@ -11,8 +13,8 @@ import java.math.BigInteger;
  * 将均值输出到控制台。
  */
 public class MeanCalculator {
-    private static int INPUT_LIST_SIZE = 15000000;
-    private static int NUM_OF_WORKERS = 5;
+    private final static int INPUT_LIST_SIZE = 15000000;
+    private final static int NUM_OF_WORKERS = 5;
 
     public static void main(String[] args) throws InterruptedException{
         DataSet dataSet = new DataSet(INPUT_LIST_SIZE);
