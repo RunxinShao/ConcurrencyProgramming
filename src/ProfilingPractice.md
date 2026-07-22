@@ -1,4 +1,4 @@
-# 调试与性能分析 · 实验手册
+# 调试与性能分析 · 实验手册(来自MIT missing semester课程的Debugging and profiling 这节课）
 
 > 面向环境:macOS(Apple Silicon)+ OrbStack Linux Machine,Ubuntu `questing`(25.10)、**amd64**(x86_64 模拟)。
 > 用法:在 Mac 终端里 `orb` 进入这台 Ubuntu 机器后,按本手册从上到下操作即可。
