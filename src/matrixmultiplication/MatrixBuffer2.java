@@ -1,7 +1,7 @@
 package matrixmultiplication;
 
 /**
- * Task 2 —— 大缓冲区管理类。
+ * Task 2 —— 大缓冲区管理类。（线程安全类）
  *
  * 缓冲区里连续存放 N 个矩阵：buffer[m][i][j]
  *   m = 第几个矩阵 (0 .. N-1)
@@ -34,6 +34,11 @@ public class MatrixBuffer2{
             }
         }
     }
+    // getnextsection这个方法有锁竞争，sectionsize的大小决定了锁竞争的次数，sectionsize越大锁竞争越少，但有可能负载不均衡
+    //sectionsize越小负载均衡但是锁竞争的开销很大
+    //最好办法是通过调整k来增加和减少单线程抢锁次数来找到最佳sectionsize
+    // sectionsize = 总任务数/（线程数 * 单线程抢锁次数k）其中k = 10 -100 之间
+    //锁竞争次数 = 总任务数/section size = 线程数 * 单线程抢锁次数
     public synchronized int getNextSection( ){
         int start = currentIndex;
         if(currentIndex >= getOffset()){
