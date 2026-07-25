@@ -2,15 +2,15 @@ package diningphilosophersolutions;
 
 import java.util.Random;
 
-public class Philosopher implements Runnable {
+public class PhilosopherLock implements Runnable {
     private int id;
-    private Fork fork1; // 共享对象1（shared object
-    private Fork fork2; // 共享对象2
+    private ForkLock fork1; // 共享对象1（shared object
+    private ForkLock fork2; // 共享对象2
     Random rand = new Random();
-    int thinkingCount = 0;
-    int eatingCount = 0;
+    int thinkingCount= 0;
+    int eatingCount=0;
     private volatile boolean running = true; // 主线程写、工作线程读，需要 volatile 保证可见性
-    public Philosopher(Fork f1, Fork f2, int id){
+    public PhilosopherLock(ForkLock f1, ForkLock f2, int id){
         this.id = id;
         this.fork1 = f1;
         this.fork2 = f2;
@@ -22,17 +22,25 @@ public class Philosopher implements Runnable {
         while(running){
             act("is thinking");
             thinkingCount++;
-            synchronized(fork1){ // 外部手动给共享对象1上锁
+            if(fork1.pickUp()){ // 尝试获取forklock内部的显示锁
                 act("has picked up left fork.");
-                synchronized(fork2){ // 拿到对象1的锁之后，尝试获取对象2的锁
+                if(fork2.pickUp()){ // 拿到对象1的锁之后，尝试获取对象2的锁,如果不成功（false）
+
                     act("has picked up right fork.");
                     act("is eating");
                     eatingCount++;
+                    //记得任务完毕之后把锁都释放掉unlock（）
+                    fork1.putDown();
+                    fork2.putDown();
+                }else{
+                    //没获取到fork2的锁，放弃获取fork2的锁，
+                    //同时手上的fork1的锁也放下
+                    fork1.putDown();
+
                 }
             }
         }
     }
-
     // 让主线程通知哲学家停止就餐循环
     public void stop(){
         running = false;
