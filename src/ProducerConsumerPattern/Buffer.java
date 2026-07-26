@@ -64,6 +64,22 @@ public class Buffer {
      * @return 取到的对象；若没抢到信号量或缓冲区为空则返回 null（调用方应睡眠后重试）。
      */
     public Computation take(){
-
+        for(int s = 0; s < numSlices; s++){
+            if (semaphores[s].tryAcquire()){
+                try{
+                    int start = s * sliceSize;
+                    for(int i = start; i < start + sliceSize; i++){
+                        if (slots[i] != null){
+                            Computation c = slots[i];
+                            slots[i] = null;
+                            return c;
+                        }
+                    }
+                }finally{
+                    semaphores[s].release();
+                }
+            }
+        }
+        return null;
     }
 }
