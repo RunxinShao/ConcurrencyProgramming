@@ -1,4 +1,15 @@
-Coding Practices for Concurrency Programming and Multithreading
+# Concurrency & Multithreading — Coding Practices
+
+A hands-on exploration of parallel and concurrent programming on the JVM (Java, JDK 26). Each lab implements a classic problem from scratch, then **measures** how design choices affect performance on real hardware — an 18-core Apple M5 Max (6 Super + 12 Performance Cores) — and writes up the results with the underlying reasoning (Amdahl's Law, lock contention, load balancing, the compute-bound vs. blocking-bound divide).
+
+**What's inside:**
+
+- **Lab 1 — Parallel mean** ([`parallelcomputation`](src/parallelcomputation)): summing 15M `BigInteger`s across N threads; thread-count scaling, the Super/Performance core knee, and a zero-copy slicing optimization that lifts the Amdahl ceiling from ~7.5× to ~15.7×.
+- **Lab 2 — Matrix multiplication** ([`matrixmultiplication`](src/matrixmultiplication)): static partitioning (lock-free) vs. dynamic work-stealing (`synchronized` cursor); the `SECTION_SIZE` contention-vs-balance trade-off.
+- **Lab 3 — Producer–consumer** ([`ProducerConsumerPattern`](src/ProducerConsumerPattern)): a sliced buffer with one semaphore per slice; throughput vs. buffer size, semaphore count, and producer/consumer ratio ([interactive charts](viz/producer-consumer.html)).
+- **Dining philosophers** ([`diningphilosophersolutions`](src/diningphilosophersolutions)): deadlock and two fixes — resource ordering (`synchronized`) vs. back-off (`tryLock`).
+
+Each section below has the tables, charts, and analysis. Measurements are demonstrative (preemptive scheduler, JIT/GC noise), so the **trends** — not the absolute numbers — are the takeaway.
 
 ## Lab 1 Performance Test Summary
 
