@@ -288,4 +288,75 @@ Two opposite behaviours, and this is the heart of the "conveyor belt" balance fr
 
 **Cross-cutting conclusion.** Because a producer sleeps on every cycle and a consumer only sleeps when starved, this system is **blocking-bound and producer-throttled**: throughput is governed by *producer count × per-producer rate*, scales linearly with threads far beyond 18 cores, and is almost insensitive to slice count and consumer count. To turn it into a *consumer*- or *contention*-bound system (where slices and consumer count would start to matter), one would shrink the producer sleep or make evaluation expensive — mirroring the compute-vs-blocking divide seen in Lab 2.
 
-> Note: as in Labs 1–2 these are demonstrative measurements (preemptive scheduler, JIT/GC noise, `Thread.sleep` granularity), so absolute ops/sec vary run to run; the **trends** — linear scaling in producer count, the inverted-U in buffer size, and the near-irrelevance of slice/consumer count — are the reproducible results.
+### Variant: no sleeps at all (spin instead of back off)
+
+The paragraph above predicts what happens if the sleeps are removed — so here is the experiment. Package [`ProducerConsumerPatternNoSleep`](src/ProducerConsumerPatternNoSleep) is a **byte-for-byte copy of the pattern with every `Thread.sleep` deleted**: producers produce-and-`add` in a tight loop (retry immediately on a full buffer), consumers `take`-and-evaluate in a tight loop (retry immediately when empty). Nothing else changes. This converts the system from **blocking/sleep-bound** to **spin / CPU-and-contention-bound**, and every result flips. (Throughput here is measured against *wall-clock* elapsed time, because the spinning threads fully saturate all cores.)
+
+![Producer–Consumer no-sleep throughput experiments](viz/producer-consumer-nosleep.png)
+
+> Rendered by [`viz/producer-consumer-nosleep.html`](viz/producer-consumer-nosleep.html). Note the y-axes are in **millions/sec** here vs **thousands/sec** in the sleep-version charts above — and every curve shape is inverted.
+
+**A. Buffer size (slices = 4, P = C = 4)** — now **monotonically rising**, not an inverted-U:
+
+| Buffer size | No-sleep (ops/s) | (sleep version) |
+|------------:|-----------------:|----------------:|
+| 4    | 2,327,497 | 1382 |
+| 8    | 3,143,074 | 2431 |
+| 16   | 3,548,308 | 3187 |
+| 40   | 3,982,743 | 3201 |
+| 400  | 4,329,675 | 2749 |
+
+Without the 1 ms cap, a bigger buffer simply means fewer full/empty collisions, so throughput keeps climbing — the per-op slice-scan cost that produced the sleep version's dip at 400 no longer outweighs the win from fewer failed attempts.
+
+**B. Slices / semaphores (buffer = 48, P = C = 8)** — was flat; now the **single most important knob** (a 30× swing):
+
+| numSlices | No-sleep (ops/s) | (sleep version) |
+|----------:|-----------------:|----------------:|
+| 1  | 172,046   | 5034 |
+| 2  | 1,716,965 | 5403 |
+| 4  | 2,948,475 | 5429 |
+| 8  | 5,150,900 | 5436 |
+| 16 | 5,467,982 | 5416 |
+| 48 | 4,733,582 | 5422 |
+
+This is the headline reversal. With 16 threads all spinning, **semaphore contention *is* the bottleneck**, so more slices = more genuine parallelism. A single global semaphore serializes everything (172 K/s — 30× worse than 8 slices); throughput peaks around 8–16 slices (≈ the thread count) and then dips at 48, where each slice holds only one slot (48/48) so full/empty misses and cross-slice scanning creep back.
+
+**C. Producer : consumer ratio (buffer = 48, slices = 8)** — consumers now matter, and **balance wins**:
+
+| Config | No-sleep (ops/s) | | Config | No-sleep (ops/s) |
+|---|--:|---|---|--:|
+| 1 prod : 8 con | 1,581,322 | | 8 prod : 1 con | 2,069,988 |
+| 2 prod : 8 con | 2,625,040 | | 8 prod : 2 con | 3,102,473 |
+| 4 prod : 8 con | 3,819,574 | | 8 prod : 4 con | 4,576,203 |
+| 8 prod : 8 con | **4,940,039** | | 8 prod : 8 con | **4,940,039** |
+| 16 prod : 8 con | 4,162,202 | | 8 prod : 16 con | 3,130,370 |
+
+In the sleep version consumers were irrelevant; here throughput peaks at the **balanced 8 : 8** and falls off on both sides. Starve either role and the other spins uselessly; oversupply either (16 : 8 or 8 : 16 → 24 threads > cores) and oversubscription plus contention drag it back down.
+
+**D. Scaling balanced P = C (buffer = 64, slices = 8)** — the sharpest reversal: **peaks at ~2 pairs, then *declines*** (the sleep version scaled linearly to 128 threads):
+
+| Producers = Consumers | Threads total | No-sleep (ops/s) | (sleep version) |
+|----------------------:|--------------:|-----------------:|----------------:|
+| 1  | 2   | 5,135,606 | 668   |
+| 2  | 4   | 7,401,608 | 1343  |
+| 4  | 8   | 5,460,735 | 2699  |
+| 8  | 16  | 5,356,637 | 5421  |
+| 16 | 32  | 4,224,525 | 10873 |
+| 32 | 64  | 2,888,100 | 21686 |
+| 64 | 128 | 1,764,024 | 42547 |
+
+Spinning threads hold the CPU, so once past a handful of threads the extra ones don't add throughput — they compete for the 18 cores and for the 8 semaphores. Beyond ~4 pairs it goes **backwards** (128 threads → 1.76 M, a 4× loss from the 7.4 M peak) to context-switching and lock contention. This is exactly the *compute-bound* behavior of the Lab 2 matrix experiments, and the mirror image of the sleep version's linear-to-128 scaling.
+
+**What removing the sleeps changed:**
+
+| Knob | Sleep version (blocking-bound) | No-sleep version (spin / contention-bound) |
+|---|---|---|
+| Absolute throughput | thousands/s (capped by the 1 ms sleep) | **millions/s** (~100–1000× higher) |
+| Buffer size | inverted-U (peak 16–40) | monotonically rising (bigger = fewer collisions) |
+| Slices / semaphores | flat — irrelevant | **dominant** — contention is the bottleneck (30× swing) |
+| Consumer count | irrelevant | matters — balance with producers wins |
+| Scaling threads | linear past 128 threads | peaks at ~2–4 pairs, then **regresses** (saturates at core count) |
+
+One system, one deleted `sleep`, and it moves cleanly across the **blocking-bound ↔ compute-bound divide**: the sleep version rewards *more threads* and ignores the shared structure; the no-sleep version rewards *less contention* (more semaphores, balanced roles, threads ≈ cores) and punishes oversubscription. The higher raw throughput of the spin version is not free — it **burns every CPU cycle busy-waiting even when idle**, which is exactly why back-off (the sleeps) is the more resource-friendly design in practice.
+
+> Note: as in Labs 1–2 these are demonstrative measurements (preemptive scheduler, JIT/GC noise, `Thread.sleep` granularity), so absolute ops/sec vary run to run; the **trends** — linear scaling in producer count (sleep version), the inverted-U in buffer size, the near-irrelevance of slice/consumer count under sleep and their dominance without it, and the blocking-vs-spin reversal — are the reproducible results.
