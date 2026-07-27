@@ -185,3 +185,96 @@ Blocking work again keeps scaling past the core count (32 → 245, 64 → 123 ms
 3. Task 2's `SECTION_SIZE` is the **lock-contention ↔ load-balance / parallelism** trade-off dial: too small explodes lock traffic, too large serializes the work and caps the maximum concurrency at `offset / section`.
 
 > Note: like Lab 1, these are demonstrative measurements (preemptive scheduler, JIT/GC noise), so absolute numbers vary run to run; the **trends** — the compute-vs-blocking divide and the U-shaped `SECTION_SIZE` curve — are the reproducible results.
+
+## Lab 3 Producer–Consumer — Throughput Experiments
+
+![Producer–Consumer throughput experiments](viz/producer-consumer.png)
+
+> The four charts above are rendered by [`viz/producer-consumer.html`](viz/producer-consumer.html) — a self-contained page with hover tooltips, a light/dark toggle, and a data-table view.
+
+**Hardware:** same 18-core machine (6 Super Cores + 12 Performance Cores), JDK 26.
+
+**System.** Producers generate random legal arithmetic operations (operands in −100…+100; division guards against a zero divisor) and try to `add()` them to a shared, *sliced* buffer; consumers `take()` and evaluate them, discarding the result. The buffer is one fixed-size array split into `numSlices` slices, **each slice guarded by its own binary semaphore**. `add()`/`take()` walk the slices, `tryAcquire()` a slice's semaphore, scan that slice for an empty/occupied slot, and always `release()` in a `finally`. Both are **non-blocking**: if no semaphore is won or the slice is full/empty they return failure, and the caller discards the item (producer) or retries (consumer) after a short sleep. The only metric is **throughput = total computations consumed per second**.
+
+**Method.** A harness builds the buffer + P producers + C consumers with **P and C controlled independently** (the deliverable `main` happens to tie both counts to `numSlices`; the harness decouples them so each knob can be varied in isolation). It starts all threads, runs for a fixed window, sets the `running` flags false, `join()`s, and sums every consumer's `consumed`. Each configuration is **3 × 3 s runs averaged, one warm-up discarded**. (The assignment specifies a 30 s window; shorter windows are used here only to keep the ~30-config sweep tractable — a per-second rate is duration-independent.)
+
+**The mechanism that governs everything.** A producer sleeps **1 ms after a successful add, 5 ms after a failure**; a consumer **never sleeps after a successful take**, only 5 ms when it finds the buffer empty. So this is a **blocking / sleep-bound** system, and — as every table below shows — throughput is set almost entirely by how fast producers are throttled by their 1 ms sleep: **≈ 665 successful ops/sec per producer** on this machine.
+
+### A. Buffer size (slices = 4, P = C = 4)
+
+| Buffer size | Slots per slice | Throughput (ops/s) |
+|------------:|----------------:|-------------------:|
+| 4    | 1   | 1382 |
+| 8    | 2   | 2431 |
+| 16   | 4   | 3187 |
+| 40   | 10  | 3201 |
+| 400  | 100 | 2749 |
+
+An **inverted-U**. When the buffer is tiny (1–2 slots per slice) it is constantly full or empty, so threads keep hitting the **failure path and its 5 ms sleep** → starvation drags throughput to 1382. More slots remove those stalls until throughput hits the 4-producer ceiling (≈ 4 × per-producer rate) and **plateaus around 16–40**. At 400 it dips again: `add()`/`take()` scan the *entire slice* while holding the semaphore, so a 100-slot slice means up to 100 slot-checks per operation — pure overhead once the buffer is already big enough. Sweet spot: **just large enough that slices rarely fill**, no larger.
+
+### B. Number of slices / semaphores (buffer = 48, P = C = 8)
+
+| numSlices | Throughput (ops/s) |
+|----------:|-------------------:|
+| 1  | 5034 |
+| 2  | 5403 |
+| 4  | 5429 |
+| 8  | 5436 |
+| 16 | 5416 |
+| 48 | 5422 |
+
+**Essentially flat.** More semaphores allow more genuinely-concurrent buffer access, but since producers self-throttle at 1 ms the buffer is *never* the bottleneck — so extra slices buy almost nothing. Only `numSlices = 1` (a single global semaphore that fully serializes all access) is measurably lower (5034 vs ~5420), and even that penalty is tiny because contention isn't the limiter here. **Lesson:** adding concurrency to a shared structure only helps if that structure is actually the bottleneck; here it isn't.
+
+### C. Producer : consumer ratio (buffer = 48, slices = 8)
+
+Varying **producers** (consumers fixed at 8):
+
+| Producers | Throughput (ops/s) |
+|----------:|-------------------:|
+| 1  | 670   |
+| 2  | 1346  |
+| 4  | 2702  |
+| 8  | 5427  |
+| 16 | 10828 |
+
+Varying **consumers** (producers fixed at 8):
+
+| Consumers | Throughput (ops/s) |
+|----------:|-------------------:|
+| 1  | 5432 |
+| 2  | 5419 |
+| 4  | 5420 |
+| 8  | 5427 |
+| 16 | 5432 |
+
+Two opposite behaviours, and this is the heart of the "conveyor belt" balance from the brief:
+
+- **Producers are the throughput lever** — dead linear, throughput ≈ `producers × 665/s`.
+- **Consumers barely matter** — dropping from 16 → 1 consumer against 8 producers leaves throughput unchanged (~5420). A **single** consumer keeps up with 8 producers, because a consumer never sleeps on success and is far faster than the sleep-throttled producers. Under these sleep settings the belt is **producer-limited**; extra consumers just find the buffer empty, sleep, and add nothing.
+
+### D. Scaling balanced producer + consumer count (buffer = 64, slices = 8)
+
+| Producers = Consumers | Threads total | Throughput (ops/s) |
+|----------------------:|--------------:|-------------------:|
+| 1  | 2   | 668   |
+| 2  | 4   | 1343  |
+| 4  | 8   | 2699  |
+| 8  | 16  | 5421  |
+| 16 | 32  | 10873 |
+| 32 | 64  | 21686 |
+| 64 | 128 | 42547 |
+
+**Perfect linear doubling all the way to 128 threads** — throughput ∝ producer count (≈ 665 × n), with no knee at the 18-core limit. This is the same lesson as Lab 2's `Thread.sleep` experiment: the system is **blocking/sleep-bound**, threads spend almost all their time asleep holding no CPU, so hundreds of threads oversubscribe the 18 cores happily and keep paying off. Contrast the *compute-bound* matrix experiments, which saturated at ~18 threads.
+
+### Summary
+
+| Knob | Effect on throughput |
+|---|---|
+| **Producer count** | The lever. Throughput ≈ `producers × ~665/s`, linear well past the core count. |
+| **Consumer count** | Nearly irrelevant under these sleep settings — even 1 consumer keeps up with 8+ producers. |
+| **Buffer size** | Inverted-U: too small → starvation via the 5 ms failure sleep; too large → per-op slice-scan overhead. |
+| **Slices / semaphores** | Nearly flat — contention isn't the bottleneck, so more semaphores don't help (only `=1` is slightly worse). |
+
+**Cross-cutting conclusion.** Because a producer sleeps on every cycle and a consumer only sleeps when starved, this system is **blocking-bound and producer-throttled**: throughput is governed by *producer count × per-producer rate*, scales linearly with threads far beyond 18 cores, and is almost insensitive to slice count and consumer count. To turn it into a *consumer*- or *contention*-bound system (where slices and consumer count would start to matter), one would shrink the producer sleep or make evaluation expensive — mirroring the compute-vs-blocking divide seen in Lab 2.
+
+> Note: as in Labs 1–2 these are demonstrative measurements (preemptive scheduler, JIT/GC noise, `Thread.sleep` granularity), so absolute ops/sec vary run to run; the **trends** — linear scaling in producer count, the inverted-U in buffer size, and the near-irrelevance of slice/consumer count — are the reproducible results.
