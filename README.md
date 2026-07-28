@@ -8,6 +8,7 @@ A hands-on exploration of parallel and concurrent programming on the JVM (Java, 
 - **Lab 2 — Matrix multiplication** ([`matrixmultiplication`](src/matrixmultiplication)): static partitioning (lock-free) vs. dynamic work-stealing (`synchronized` cursor); the `SECTION_SIZE` contention-vs-balance trade-off.
 - **Lab 3 — Producer–consumer** ([`ProducerConsumerPattern`](src/ProducerConsumerPattern)): a sliced buffer with one semaphore per slice; throughput vs. buffer size, semaphore count, and producer/consumer ratio ([interactive charts](viz/producer-consumer.html)).
 - **Dining philosophers** ([`diningphilosophersolutions`](src/diningphilosophersolutions)): deadlock and two fixes — resource ordering (`synchronized`) vs. back-off (`tryLock`).
+- **Thread pool** ([`ThreadPool`](src/ThreadPool)): a fixed-size pool built from scratch on a `ReentrantLock` + `Condition` work queue — the classic wait/notify producer-consumer, applied to *tasks*.
 
 Each section below has the tables, charts, and analysis. Measurements are demonstrative (preemptive scheduler, JIT/GC noise), so the **trends** — not the absolute numbers — are the takeaway.
 
@@ -360,3 +361,37 @@ Spinning threads hold the CPU, so once past a handful of threads the extra ones 
 One system, one deleted `sleep`, and it moves cleanly across the **blocking-bound ↔ compute-bound divide**: the sleep version rewards *more threads* and ignores the shared structure; the no-sleep version rewards *less contention* (more semaphores, balanced roles, threads ≈ cores) and punishes oversubscription. The higher raw throughput of the spin version is not free — it **burns every CPU cycle busy-waiting even when idle**, which is exactly why back-off (the sleeps) is the more resource-friendly design in practice.
 
 > Note: as in Labs 1–2 these are demonstrative measurements (preemptive scheduler, JIT/GC noise, `Thread.sleep` granularity), so absolute ops/sec vary run to run; the **trends** — linear scaling in producer count (sleep version), the inverted-U in buffer size, the near-irrelevance of slice/consumer count under sleep and their dominance without it, and the blocking-vs-spin reversal — are the reproducible results.
+
+## Thread Pool — a fixed-size pool from scratch
+
+[`ThreadPool`](src/ThreadPool) implements a minimal fixed-size thread pool in one class, [`MyThreadPool`](src/ThreadPool/MyThreadPool.java), without touching `java.util.concurrent`'s executors. It is the producer–consumer pattern again, but the *items* are `Runnable` tasks: callers **submit** tasks (producers), and a fixed set of worker threads **take and run** them (consumers).
+
+**Design.**
+
+- **Fixed pool.** `poolSize` worker threads are started in the constructor; each runs `workerLoop()` forever until shutdown.
+- **One lock, one condition.** A `ReentrantLock` guards a shared `ArrayDeque<Runnable>` work queue; a single `Condition` (`notEmpty`) is the "queue has work" signal — the explicit-lock equivalent of `synchronized` + `wait`/`notify`.
+- **Workers block, never spin.** An idle worker calls `notEmpty.await()`, which **releases the lock and parks the thread** — no busy-waiting, no CPU burned while the queue is empty (the resource-friendly design the no-sleep experiment above argues for).
+- **`submit()`** locks, rejects if already shut down, `offer`s the task, and `signal()`s one waiting worker.
+- **`shutdown()`** sets a `volatile` flag, `signalAll()`s every parked worker so they can drain the queue and exit, then `join()`s them — a **graceful** shutdown that finishes queued work rather than dropping it.
+
+**Correctness points worth calling out:**
+
+- The wait is a `while (queue.isEmpty() && !shutdown)` loop, not an `if` — guarding against spurious wakeups and lost races, the standard condition-variable discipline.
+- `lock`/`unlock` is always paired in `try/finally`, so an exception can never leak the lock.
+- `task.run()` is called **outside** the lock, so one task's work never blocks other workers from pulling from the queue; a throwing task is caught so it can't kill its worker thread.
+- Shutdown only exits a worker once `shutdown && queue.isEmpty()`, guaranteeing every submitted task still runs.
+
+**Demo** ([`Main`](src/ThreadPool/Main.java)) — pool size 3, eight 300 ms tasks:
+
+```
+>>> [版本B: ReentrantLock] 池大小 N = 3，提交 8 个任务
+  [开始] 任务 1 @ worker-0
+  [开始] 任务 2 @ worker-1
+  [开始] 任务 3 @ worker-2
+  [完成] 任务 1 @ worker-0
+  ...
+  [开始] 任务 8 @ worker-1
+>>> 全部完成，线程池已关闭
+```
+
+The three workers pick up tasks 1–3 immediately, then reuse the same threads for 4–6 and 7–8 as they free up — the whole point of a pool: **threads are reused across many tasks instead of one-thread-per-task**, so the eight tasks run three-at-a-time on a constant three OS threads.
