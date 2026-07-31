@@ -288,11 +288,11 @@ A **~4.2× speedup from reordering three lines** — no extra threads, no new da
 
 **Before — i-j-k** (`Bench1.multiply` is the single wide plateau eating the whole stack):
 
-![Flame graph before — i-j-k, multiply is 93% of CPU](bench/flame-bench1-before-ijk.svg)
+![Flame graph before — i-j-k, multiply is 93% of CPU](viz/flame-bench1-before-ijk.svg)
 
 **After — i-k-j** (same run, far fewer samples; the `multiply` plateau shrinks and the G1 GC frames beside it now take a visibly larger slice):
 
-![Flame graph after — i-k-j, multiply share drops, GC relatively larger](bench/flame-bench1-after-ikj.svg)
+![Flame graph after — i-k-j, multiply share drops, GC relatively larger](viz/flame-bench1-after-ikj.svg)
 
 ### The Amdahl's-Law reading — is `multiply` the serial part?
 
@@ -300,7 +300,7 @@ A **~4.2× speedup from reordering three lines** — no extra threads, no new da
 
 This has a subtle Amdahl consequence, and the flame graph makes it visible. Making the parallel part ~4.2× cheaper while the fixed overheads stay constant **raises the serial *fraction*** — the opposite of Lab 1's zero-copy win (which cut the serial part and *lifted* the ceiling). You can see the shift directly: the G1 GC frame `fwd_copy_again` is roughly the same in absolute samples (45 → 47, allocation is unchanged) but jumps from **~5% to ~14%** of the run, because the compute it used to hide behind collapsed. In other words, the i-k-j fix removes CPU work from the part that already scaled well; to push *this* program's Amdahl ceiling next you'd attack the now-relatively-larger fixed costs — reuse/pre-allocate the result matrices to cut that GC, and reduce per-pair allocation — not the loop.
 
-**Artifacts:** the static SVGs embedded above (`bench/flame-bench1-before-ijk.svg`, `bench/flame-bench1-after-ikj.svg`), plus the fully interactive versions [`bench/flame-bench1-before-ijk.html`](bench/flame-bench1-before-ijk.html) and [`bench/flame-bench1-after-ikj.html`](bench/flame-bench1-after-ikj.html) (open in a browser to zoom/search; widest frame = hottest). Both `Bench1.java` and `Bench2.java` now use the i-k-j order.
+**Artifacts:** the static SVGs embedded above live in [`viz/`](viz) (`viz/flame-bench1-before-ijk.svg`, `viz/flame-bench1-after-ikj.svg`). The fully interactive HTML versions (zoom/search; widest frame = hottest) are generated into the local `bench/` working dir, which is not committed — regenerate them with the commands above. Both `Bench1.java` and `Bench2.java` now use the i-k-j order.
 
 > Note: as elsewhere, demonstrative measurements — absolute ms and sample counts vary run to run; the reproducible results are the **~4× locality speedup** and the **rise in the GC/overhead fraction** once the dominant compute is optimized.
 
