@@ -5,7 +5,7 @@ A hands-on exploration of parallel and concurrent programming on the JVM (Java, 
 **What's inside:**
 
 - **Lab 1 — Parallel mean** ([`parallelcomputation`](src/parallelcomputation)): summing 15M `BigInteger`s across N threads; thread-count scaling, the Super/Performance core knee, and a zero-copy slicing optimization that lifts the Amdahl ceiling from ~7.5× to ~15.7×.
-- **Lab 2 — Matrix multiplication** ([`matrixmultiplication`](src/matrixmultiplication)): static partitioning (lock-free) vs. dynamic work-stealing (`synchronized` cursor); the `SECTION_SIZE` contention-vs-balance trade-off.
+- **Lab 2 — Matrix multiplication** ([`matrixmultiplication`](src/matrixmultiplication)): static partitioning (lock-free) vs. dynamic work-stealing (`synchronized` cursor); the `SECTION_SIZE` contention-vs-balance trade-off; plus an **async-profiler** flame graph that pinpoints the naive multiply loop and a **~4.2× i-k-j cache-locality fix**.
 - **Lab 3 — Producer–consumer** ([`ProducerConsumerPattern`](src/ProducerConsumerPattern)): a sliced buffer with one semaphore per slice; throughput vs. buffer size, semaphore count, and producer/consumer ratio ([interactive charts](viz/producer-consumer.html)).
 - **Dining philosophers** ([`diningphilosophersolutions`](src/diningphilosophersolutions)): deadlock and two fixes — resource ordering (`synchronized`) vs. back-off (`tryLock`).
 - **Thread pool** ([`ThreadPool`](src/ThreadPool)): a fixed-size pool built from scratch on a `ReentrantLock` + `Condition` work queue — the classic wait/notify producer-consumer, applied to *tasks*.
@@ -197,6 +197,112 @@ Blocking work again keeps scaling past the core count (32 → 245, 64 → 123 ms
 3. Task 2's `SECTION_SIZE` is the **lock-contention ↔ load-balance / parallelism** trade-off dial: too small explodes lock traffic, too large serializes the work and caps the maximum concurrency at `offset / section`.
 
 > Note: like Lab 1, these are demonstrative measurements (preemptive scheduler, JIT/GC noise), so absolute numbers vary run to run; the **trends** — the compute-vs-blocking divide and the U-shaped `SECTION_SIZE` curve — are the reproducible results.
+
+## Lab 2 Profiling — async-profiler & the i-k-j cache optimization
+
+All the Task 1/2 experiments above vary *how the work is scheduled* across threads. This section instead asks **where the time actually goes inside a single worker**, using [async-profiler](https://github.com/async-profiler/async-profiler) to sample the running JVM and render a flame graph — then acts on what it shows.
+
+**How it was profiled** (macOS, Apple Silicon — `perf`'s `cpu` event is Linux-only, so use `itimer`). The full commands to reproduce both flame graphs from scratch:
+
+```bash
+# 0. Install async-profiler (one-time). macOS:
+brew install async-profiler
+LIB=/opt/homebrew/opt/async-profiler/lib/libasyncProfiler.dylib   # agent library path
+# Linux: download from github.com/async-profiler/async-profiler/releases
+#        LIB=/path/to/async-profiler/lib/libasyncProfiler.so
+#        (and enable perf: sudo sysctl kernel.perf_event_paranoid=1)
+
+# 1. Compile the benchmark
+cd bench && javac Bench1.java
+
+# 2. Attach the profiler as a JVM agent and run — flame graph written on exit.
+#    event=itimer  -> CPU sampling that works on macOS (use event=cpu on Linux)
+#    interval=5ms  -> sample every 5 ms   file=*.html -> render a flame graph
+#    args "2 48 800 0 0" = 2 workers, 48 matrices of 800×800 (24 pairs), no sleep, no warmup
+java -agentpath:$LIB=start,event=itimer,interval=5ms,file=flame-bench1.html \
+     Bench1 2 48 800 0 0
+
+# 3. Open it (widest frame = hottest). macOS: `open`, Linux: `xdg-open`
+open flame-bench1.html
+
+# --- Optional: emit folded/collapsed stacks (raw per-frame counts) ---
+java -agentpath:$LIB=start,event=itimer,interval=5ms,collapsed,file=flame.collapsed \
+     Bench1 2 48 800 0 0
+#   rank leaf frames by self-samples:
+awk '{n=$NF;$NF="";m=split($0,a,";");leaf=a[m];sub(/^ +/,"",leaf);s[leaf]+=n}
+     END{for(k in s)print s[k],k}' flame.collapsed | sort -rn | head
+
+# --- Optional: render a static SVG from the collapsed stacks (the images below) ---
+#     async-profiler 4.x no longer emits .svg directly, so use Brendan Gregg's script:
+curl -fsSL -o flamegraph.pl \
+     https://raw.githubusercontent.com/brendangregg/FlameGraph/master/flamegraph.pl
+perl flamegraph.pl --colors=java --width=1000 --countname=samples \
+     --title="Bench1.multiply (i-k-j)" flame.collapsed > flame.svg
+
+# --- Optional: profile an already-running JVM instead of launching one ---
+asprof -d 30 -e itimer -f flame.html <pid>      # sample <pid> for 30 s (find it with: jps)
+```
+
+> The before/after graphs in this repo were produced by running step 2 with the original i-j-k `multiply` (saved as `flame-bench1-before-ijk.html`) and again after the i-k-j edit (`flame-bench1-after-ikj.html`).
+
+**What the flame graph showed (before).** One frame dominated everything:
+
+| Frame | Samples | Share | Meaning |
+|---|--:|--:|---|
+| `Bench1.multiply` | 841 | **93.3%** | the triple loop — essentially all the time |
+| `fwd_copy_again` (G1 GC) | 45 | ~5% | GC evacuating the result matrices `multiply` allocates each pair |
+| locks / malloc / JIT | 15 | ~1.7% | noise |
+
+93% of the program's CPU time was one method. The culprit was the loop order in the original `multiply`:
+
+```java
+for (int j = 0; j < b[0].length; j++) {
+    double sum = 0;
+    for (int k = 0; k < a[0].length; k++) sum += a[i][k] * b[k][j];  // b[k][j] walks a COLUMN
+    r[i][j] = sum;
+}
+```
+
+`b[k][j]` marches **down a column** of a row-major array — each `k++` jumps a full row (800 doubles = 6.4 KB) in memory, so almost every access is a cache miss.
+
+**The fix — reorder to i-k-j** so the inner loop walks `b[k]` and `r[i]` **left-to-right** (contiguous), turning column-striding into sequential reads:
+
+```java
+for (int k = 0; k < a[0].length; k++) {
+    double aik = a[i][k];
+    double[] bk = b[k];
+    for (int j = 0; j < b[0].length; j++) r[i][j] += aik * bk[j];  // bk[j], r[i] both sequential
+}
+```
+
+Mathematically identical (just re-associates the same sum); only the memory access pattern changes.
+
+### Results — before vs after (same config, steady-state, warm JIT, median of 4)
+
+| Config | i-j-k (before) | i-k-j (after) | Speedup |
+|---|--:|--:|--:|
+| 2 workers, dim 800, 24 pairs | 3816 ms | 911 ms | **4.19×** |
+| 1 worker, dim 800, 24 pairs  | 7016 ms | 1639 ms | **4.28×** |
+
+A **~4.2× speedup from reordering three lines** — no extra threads, no new data structures, purely better cache locality. The flame graph confirms it: `Bench1.multiply`'s share drops from **93.3% → 80.7%**, and total CPU samples over the run fall from 901 to 331.
+
+**Before — i-j-k** (`Bench1.multiply` is the single wide plateau eating the whole stack):
+
+![Flame graph before — i-j-k, multiply is 93% of CPU](bench/flame-bench1-before-ijk.svg)
+
+**After — i-k-j** (same run, far fewer samples; the `multiply` plateau shrinks and the G1 GC frames beside it now take a visibly larger slice):
+
+![Flame graph after — i-k-j, multiply share drops, GC relatively larger](bench/flame-bench1-after-ikj.svg)
+
+### The Amdahl's-Law reading — is `multiply` the serial part?
+
+**No — `multiply` is the *parallel* part.** It is exactly the work that gets split across the worker threads (each worker multiplies its own disjoint set of pairs into a private `res` list, no shared state). The **serial** portion of this program is elsewhere: `initBuffer` allocating all N matrices on the main thread, the `new Thread(...)` creation + `join()`, and — in Task 2 — the `synchronized getNextSection()` cursor. So optimizing `multiply` shrinks the *parallelizable* work, not the serial bottleneck.
+
+This has a subtle Amdahl consequence, and the flame graph makes it visible. Making the parallel part ~4.2× cheaper while the fixed overheads stay constant **raises the serial *fraction*** — the opposite of Lab 1's zero-copy win (which cut the serial part and *lifted* the ceiling). You can see the shift directly: the G1 GC frame `fwd_copy_again` is roughly the same in absolute samples (45 → 47, allocation is unchanged) but jumps from **~5% to ~14%** of the run, because the compute it used to hide behind collapsed. In other words, the i-k-j fix removes CPU work from the part that already scaled well; to push *this* program's Amdahl ceiling next you'd attack the now-relatively-larger fixed costs — reuse/pre-allocate the result matrices to cut that GC, and reduce per-pair allocation — not the loop.
+
+**Artifacts:** the static SVGs embedded above (`bench/flame-bench1-before-ijk.svg`, `bench/flame-bench1-after-ikj.svg`), plus the fully interactive versions [`bench/flame-bench1-before-ijk.html`](bench/flame-bench1-before-ijk.html) and [`bench/flame-bench1-after-ikj.html`](bench/flame-bench1-after-ikj.html) (open in a browser to zoom/search; widest frame = hottest). Both `Bench1.java` and `Bench2.java` now use the i-k-j order.
+
+> Note: as elsewhere, demonstrative measurements — absolute ms and sample counts vary run to run; the reproducible results are the **~4× locality speedup** and the **rise in the GC/overhead fraction** once the dominant compute is optimized.
 
 ## Lab 3 Producer–Consumer — Throughput Experiments
 
